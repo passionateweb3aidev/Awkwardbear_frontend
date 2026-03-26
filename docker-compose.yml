@@ -1,0 +1,49 @@
+version: "3.8"
+
+services:
+  abdao-pet:
+    image: abdao-pet:latest
+    container_name: abdao-pet
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - HOSTNAME=0.0.0.0
+      - NEXT_TELEMETRY_DISABLED=1
+      # 以下环境变量需要根据实际情况配置
+      # 方式1: 直接在这里配置（不推荐，容易泄露）
+      # - NEXTAUTH_SECRET=your-secret
+      # - NEXTAUTH_URL=https://yourdomain.com
+      # - TWITTER_CLIENT_ID=your-client-id
+      # - TWITTER_CLIENT_SECRET=your-client-secret
+
+      # 方式2: 从 .env 文件加载（推荐）
+      # 创建 .env 文件并配置变量，docker-compose 会自动加载
+    env_file:
+      - .env.local # 本地开发使用，生产环境改为 .env.production
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get('http://localhost:3000', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    # 资源限制（可选，但生产环境推荐）
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
