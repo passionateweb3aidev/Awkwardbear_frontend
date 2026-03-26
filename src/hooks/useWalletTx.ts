@@ -22,9 +22,26 @@ const bscChain = {
 function wrapProviderForChain(provider: unknown, chain: string) {
   const p = provider as { request(args: unknown, chain?: string): Promise<unknown> };
   return {
-    request: (args: { method: string; params?: unknown }) =>
-      p.request(args, chain),
+    request: async (args: { method: string; params?: unknown }) => {
+      // Injected providers follow EIP-1193 (request(args)).
+      // UniversalProvider can require request(args, chain).
+      try {
+        return await p.request(args);
+      } catch {
+        return p.request(args, chain);
+      }
+    },
   };
+}
+
+function isRetryableWalletError(error: unknown) {
+  const message = (error as Error)?.message?.toLowerCase?.() || "";
+  return (
+    message.includes("disconnected") ||
+    message.includes("network changed") ||
+    message.includes("session") ||
+    message.includes("transport")
+  );
 }
 
 export function useWalletTx() {
@@ -47,13 +64,24 @@ export function useWalletTx() {
         chain: bscChain,
         transport: custom(wrappedProvider),
       });
-      const hash = await walletClient.sendTransaction({
-        to: params.to,
-        data: params.data ?? "0x",
-        value: params.value ?? BigInt(0),
-        chainId,
-      });
-      return hash;
+
+      const sendOnce = () =>
+        walletClient.sendTransaction({
+          to: params.to,
+          data: params.data ?? "0x",
+          value: params.value ?? BigInt(0),
+          chainId,
+        });
+
+      try {
+        return await sendOnce();
+      } catch (error) {
+        if (!isRetryableWalletError(error)) {
+          throw error;
+        }
+        // Retry once for flaky wallet-provider reconnect edge-cases.
+        return await sendOnce();
+      }
     },
     [provider, address]
   );

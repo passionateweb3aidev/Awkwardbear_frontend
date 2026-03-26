@@ -27,13 +27,22 @@ import toast from "react-hot-toast";
 
 type Client = IUniversalProvider["client"];
 type AppKit = ReturnType<typeof createAppKit>;
+type WalletRequestArgs = {
+  method: string;
+  params?: object | unknown[] | Record<string, unknown>;
+};
+type WalletRpcProvider = {
+  request: (...args: [WalletRequestArgs, string?, number?]) => Promise<unknown>;
+  client?: Client;
+  session?: SessionTypes.Struct;
+};
 
 interface WalletConnectContextValue {
   isInitializing: boolean;
   /** UniversalProvider 的 client，用于 relayer.restartTransport 等 */
   client: Client | undefined;
   session: SessionTypes.Struct | undefined;
-  provider: IUniversalProvider | undefined;
+  provider: WalletRpcProvider | undefined;
   accounts: string[];
   address: `0x${string}` | undefined;
   chainId: number | undefined;
@@ -65,9 +74,67 @@ let appkit: AppKit | undefined;
 let wagmiAdapter: WagmiAdapter | undefined;
 let creatingProvider = false;
 
+const MOBILE_UA_REGEXP =
+  /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i;
+
+function isMobileBrowser() {
+  return typeof navigator !== "undefined" && MOBILE_UA_REGEXP.test(navigator.userAgent);
+}
+
+function isTelegramWebView() {
+  type TelegramWindow = Window & {
+    TelegramWebviewProxy?: unknown;
+    Telegram?: { WebApp?: { initData?: string } };
+  };
+  const telegramWindow = window as TelegramWindow;
+  return (
+    typeof window !== "undefined" &&
+    (telegramWindow.TelegramWebviewProxy !== undefined || !!telegramWindow.Telegram?.WebApp?.initData)
+  );
+}
+
+function toNumberChainId(chainId: unknown): number | undefined {
+  if (typeof chainId === "number" && Number.isFinite(chainId)) return chainId;
+  if (typeof chainId === "string") {
+    if (chainId.startsWith("0x")) {
+      const hex = Number.parseInt(chainId, 16);
+      return Number.isFinite(hex) ? hex : undefined;
+    }
+    const dec = Number.parseInt(chainId, 10);
+    return Number.isFinite(dec) ? dec : undefined;
+  }
+  return undefined;
+}
+
+function parseSessionAddress(_session: SessionTypes.Struct): `0x${string}` | undefined {
+  const account = _session?.namespaces?.eip155?.accounts?.[0];
+  if (!account) return undefined;
+  const parts = account.split(":");
+  return parts[parts.length - 1] as `0x${string}`;
+}
+
+function parseSessionChainId(_session: SessionTypes.Struct): number | undefined {
+  const chain = _session?.namespaces?.eip155?.chains?.[0];
+  if (!chain) return undefined;
+  const [, id] = chain.split(":");
+  const parsed = Number.parseInt(id || "0", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function parseChainIdFromCaipAddress(caipAddress: string | undefined): number | undefined {
+  if (!caipAddress) return undefined;
+  const [, id] = caipAddress.split(":");
+  const parsed = Number.parseInt(id || "0", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 export function WalletConnectProvider({ children }: { children: React.ReactNode }) {
-  const [provider, setProvider] = useState<IUniversalProvider>();
+  const [provider, setProvider] = useState<WalletRpcProvider>();
+  const [universalProvider, setUniversalProvider] = useState<IUniversalProvider>();
   const [session, setSession] = useState<SessionTypes.Struct>();
+  const [accountAddress, setAccountAddress] = useState<`0x${string}`>();
+  const [accountChainId, setAccountChainId] = useState<number>();
+  const [accountWalletName, setAccountWalletName] = useState<string>();
   const [isInitializing, setIsInitializing] = useState(true);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
@@ -76,63 +143,55 @@ export function WalletConnectProvider({ children }: { children: React.ReactNode 
   const [isMobileWalletModalOpen, setIsMobileWalletModalOpen] = useState(false);
 
   const initStarted = useRef(false);
+  const appkitUnsubscribers = useRef<Array<() => void>>([]);
 
   const chains = useMemo(() => [BSC_CHAIN], []);
 
   const reset = useCallback(() => {
     setSession(undefined);
-  }, []);
+    setAccountAddress(undefined);
+    setAccountChainId(undefined);
+    setAccountWalletName(undefined);
+    setProvider(universalProvider);
+  }, [universalProvider]);
 
   const onSessionConnected = useCallback((_session: SessionTypes.Struct) => {
     setSession(_session);
-  }, []);
+    setProvider(universalProvider);
+    setAccountAddress(parseSessionAddress(_session));
+    setAccountChainId(parseSessionChainId(_session));
+    setAccountWalletName(_session?.peer?.metadata?.name);
+  }, [universalProvider]);
 
   const connect = useCallback(
     async (pairing?: { topic: string }) => {
-      if (!provider) {
+      if (!universalProvider) {
         throw new Error("WalletConnect is not initialized");
       }
       setIsConnecting(true);
-      let shouldAutoCloseModal = true;
+
+      const isMobile = isMobileBrowser();
+      const isTelegram = isTelegramWebView();
+      const shouldUseDesktopModal = !isMobile && !isTelegram;
+
+      if (shouldUseDesktopModal) {
+        try {
+          await appkit?.open?.({ view: "Connect" });
+          setIsModalOpen(true);
+        } finally {
+          setIsConnecting(false);
+        }
+        return;
+      }
+
       try {
         const namespacesToRequest = getRequiredNamespaces(chains);
 
-        const isMobile =
-          typeof navigator !== "undefined" &&
-          /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
-            navigator.userAgent,
-          );
-        const isTelegram =
-          typeof window !== "undefined" &&
-          ((window as any).TelegramWebviewProxy !== undefined ||
-            !!(window as any).Telegram?.WebApp?.initData);
-
-        // PC 端：打开 Connect 视图（钱包卡片列表），并且不要手动 provider.connect()
-        // 否则会立刻触发 display_uri -> 直接跳通用二维码页
-        if (!isMobile) {
-          shouldAutoCloseModal = false;
-          appkit?.open?.({ view: "Connect" } as any);
-          setIsModalOpen(true);
-          // PC 端也订阅 open 状态，方便外部（WalletAuthSync）在连上后关闭
-          appkit?.subscribeState?.((state: { open: boolean }) => {
-            setIsModalOpen(!!state?.open);
-          });
-          return;
-        }
-
-        // 仅对 Telegram 使用 AppKit 原有的手动逻辑
         if (isTelegram) {
           appkit?.open();
           setIsModalOpen(true);
-
-          appkit?.subscribeState?.((state: { open: boolean }) => {
-            setIsModalOpen(!!state?.open);
-            if (!state?.open && !provider.session) {
-              throw new Error("Connection request reset. Please try again.");
-            }
-          });
         } else {
-          // iOS / Android 普通网页使用自定义的 Modal，由 display_uri 监听器触发！
+          // 普通移动端网页通过 display_uri 触发自定义深链弹窗
           setIsModalOpen(true);
         }
 
@@ -152,11 +211,11 @@ export function WalletConnectProvider({ children }: { children: React.ReactNode 
             ]
           : undefined;
 
-        (provider as { namespaces?: unknown }).namespaces = undefined;
-        const newSession = await provider.connect({
+        (universalProvider as { namespaces?: unknown }).namespaces = undefined;
+        const newSession = await universalProvider.connect({
           pairingTopic: pairing?.topic,
           optionalNamespaces: namespacesToRequest as NamespaceConfig,
-          authentication, // 避免 iOS 和 Android 外部环境 URI 过长！
+          authentication,
         });
 
         if (!newSession) {
@@ -170,36 +229,27 @@ export function WalletConnectProvider({ children }: { children: React.ReactNode 
         throw e;
       } finally {
         setIsConnecting(false);
-        if (shouldAutoCloseModal) {
-          appkit?.close();
-          setIsMobileWalletModalOpen(false);
-          setIsModalOpen(false);
-        }
+        appkit?.close();
+        setIsMobileWalletModalOpen(false);
+        setIsModalOpen(false);
       }
     },
-    [provider, chains, onSessionConnected],
+    [universalProvider, chains, onSessionConnected],
   );
 
   const disconnect = useCallback(async () => {
-    const client = provider?.client;
-    if (!client) {
-      reset();
-      return;
-    }
-    if (!session) {
-      reset();
-      return;
-    }
     try {
-      await client.disconnect({
-        topic: session.topic,
-        reason: getSdkError("USER_DISCONNECTED"),
-      });
-      // 对开启了防注入与 AppKit 管理的 PC 端，也要调用内置的断开方法以清理内部状态（特别是 MetaMask 缓存状态）
       try {
         await appkit?.disconnect();
       } catch {
         // ignore
+      }
+      const client = universalProvider?.client;
+      if (client && session?.topic) {
+        await client.disconnect({
+          topic: session.topic,
+          reason: getSdkError("USER_DISCONNECTED"),
+        });
       }
       reset();
     } catch (error) {
@@ -209,10 +259,10 @@ export function WalletConnectProvider({ children }: { children: React.ReactNode 
       });
       throw error;
     }
-  }, [provider, session, reset]);
+  }, [universalProvider, session, reset]);
 
   const openModal = useCallback(() => {
-    appkit?.open();
+    appkit?.open({ view: "Connect" });
     setIsModalOpen(true);
   }, []);
 
@@ -222,27 +272,32 @@ export function WalletConnectProvider({ children }: { children: React.ReactNode 
   }, []);
 
   const accounts = useMemo(() => {
-    if (!session?.namespaces?.eip155?.accounts?.length) return [];
-    return session.namespaces.eip155.accounts;
-  }, [session]);
+    if (session?.namespaces?.eip155?.accounts?.length) return session.namespaces.eip155.accounts;
+    if (accountAddress) {
+      return [`eip155:${accountChainId ?? BEAR_NFT.chainId}:${accountAddress}`];
+    }
+    return [];
+  }, [session, accountAddress, accountChainId]);
 
   const address = useMemo((): `0x${string}` | undefined => {
+    if (accountAddress) return accountAddress;
     const acc = accounts[0];
     if (!acc) return undefined;
     const parts = acc.split(":");
     return parts[parts.length - 1] as `0x${string}`;
-  }, [accounts]);
+  }, [accounts, accountAddress]);
 
   const chainId = useMemo(() => {
+    if (accountChainId) return accountChainId;
     if (!session?.namespaces?.eip155?.chains?.length) return undefined;
     const caip = session.namespaces.eip155.chains[0];
     const [, id] = caip.split(":");
     return parseInt(id || "0", 10) || undefined;
-  }, [session]);
+  }, [session, accountChainId]);
 
   const walletName = useMemo(() => {
-    return session?.peer?.metadata?.name;
-  }, [session]);
+    return accountWalletName || session?.peer?.metadata?.name;
+  }, [accountWalletName, session]);
 
   useEffect(() => {
     if (typeof window === "undefined" || initStarted.current) return;
@@ -253,7 +308,7 @@ export function WalletConnectProvider({ children }: { children: React.ReactNode 
         if (creatingProvider) return;
         creatingProvider = true;
 
-        const universalProvider = await UniversalProvider.init({
+        const nextUniversalProvider = await UniversalProvider.init({
           projectId,
           metadata: {
             name: metadata.name,
@@ -263,20 +318,11 @@ export function WalletConnectProvider({ children }: { children: React.ReactNode 
           },
         });
 
-        const isMobile =
-          typeof navigator !== "undefined" &&
-          /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
-            navigator.userAgent,
-          );
-
-        const isTelegram =
-          typeof window !== "undefined" &&
-          ((window as any).TelegramWebviewProxy !== undefined ||
-            !!(window as any).Telegram?.WebApp?.initData);
+        const isMobile = isMobileBrowser();
+        const isTelegram = isTelegramWebView();
 
         if (!isTelegram && isMobile) {
-          // listen for display_uri
-          universalProvider.on("display_uri", (uri: string) => {
+          nextUniversalProvider.on("display_uri", (uri: string) => {
             console.log("display_uri emitted:", uri);
             setMobileUri(uri);
             setIsMobileWalletModalOpen(true);
@@ -294,10 +340,8 @@ export function WalletConnectProvider({ children }: { children: React.ReactNode 
             });
           }
 
-          // 关键：为了不影响普通移动端浏览器（能正常拦截 display_uri 唤起原生钱包），
-          // 我们这里“仅在” Telegram 或 PC 环境下，执行不常规的 Provider 注入双重绑定操作。
-          if (isTelegram || !isMobile) {
-            await wagmiAdapter.setUniversalProvider(universalProvider as any);
+          if (isTelegram) {
+            await wagmiAdapter.setUniversalProvider(nextUniversalProvider);
           }
 
           appkit = createAppKit({
@@ -305,11 +349,9 @@ export function WalletConnectProvider({ children }: { children: React.ReactNode 
             projectId,
             networks: networks as [typeof bsc, ...(typeof bsc)[]],
             metadata,
-            // 关键：让 PC 端先展示钱包卡片列表（否则会直接进入二维码流程）
             showWallets: true,
-            // 仅移动端开启 manualWCControl（二维码），PC 端关闭以先展示 4 个钱包卡片
-            manualWCControl: Boolean(isMobile),
-            universalProvider: isTelegram || !isMobile ? (universalProvider as never) : undefined,
+            manualWCControl: Boolean(isMobile && !isTelegram),
+            universalProvider: isTelegram ? (nextUniversalProvider as never) : undefined,
             defaultNetwork: bsc,
             themeMode: "light",
             features: {
@@ -319,7 +361,7 @@ export function WalletConnectProvider({ children }: { children: React.ReactNode 
             },
             enableEIP6963: !isMobile && !isTelegram,
             enableInjected: !isMobile && !isTelegram,
-            enableWalletConnect: isMobile || isTelegram,
+            enableWalletConnect: true,
             enableCoinbase: false,
             allowUnsupportedChain: true,
             customRpcUrls,
@@ -338,18 +380,10 @@ export function WalletConnectProvider({ children }: { children: React.ReactNode 
           });
         }
 
-        setProvider(universalProvider);
+        setUniversalProvider(nextUniversalProvider);
+        setProvider(nextUniversalProvider);
 
-        const client = universalProvider.client;
-        // 首次建立 session 时，PC 端可能不会触发 session_update，需要额外监听 session_connect
-        try {
-          (client as any)?.on?.("session_connect", (args: any) => {
-            const nextSession = args?.session;
-            if (nextSession) onSessionConnected(nextSession);
-          });
-        } catch {
-          // ignore
-        }
+        const client = nextUniversalProvider.client;
         if (client?.session?.length) {
           const lastKey = client.session.keys[client.session.keys.length - 1];
           const existingSession = client.session.get(lastKey);
@@ -358,16 +392,13 @@ export function WalletConnectProvider({ children }: { children: React.ReactNode 
           }
         }
 
-        client?.on?.("session_event", () => {});
-        try {
-          (client as any)?.on?.("session_connect", (args: any) => {
-            console.log("[WC][event] session_connect");
-            const nextSession = args?.session;
-            if (nextSession) onSessionConnected(nextSession);
-          });
-        } catch {
-          // ignore
-        }
+        const sessionEventClient = client as unknown as {
+          on?: (event: string, listener: (payload: unknown) => void) => void;
+        };
+        sessionEventClient.on?.("session_connect", (payload) => {
+          const nextSession = (payload as { session?: SessionTypes.Struct })?.session;
+          if (nextSession) onSessionConnected(nextSession);
+        });
         client?.on?.("session_update", ({ topic, params }) => {
           console.log("[WC][event] session_update");
           const { namespaces } = params;
@@ -377,6 +408,39 @@ export function WalletConnectProvider({ children }: { children: React.ReactNode 
         client?.on?.("session_delete", () => {
           reset();
         });
+
+        if (appkit) {
+          appkitUnsubscribers.current.forEach((unsubscribe) => unsubscribe());
+          appkitUnsubscribers.current = [
+            appkit.subscribeState((state) => {
+              setIsModalOpen(Boolean(state?.open));
+            }),
+            appkit.subscribeAccount((state) => {
+              const connected = Boolean(state?.isConnected && state?.address);
+              if (!connected) {
+                setAccountAddress(undefined);
+                setAccountChainId(undefined);
+                setAccountWalletName(undefined);
+                setProvider(nextUniversalProvider);
+                return;
+              }
+              const nextWalletProvider = appkit?.getWalletProvider() as WalletRpcProvider | undefined;
+              const nextWalletInfo = appkit?.getWalletInfo("eip155");
+              setProvider(nextWalletProvider ?? nextUniversalProvider);
+              setSession(undefined);
+              setAccountAddress(state?.address as `0x${string}`);
+              setAccountChainId(
+                toNumberChainId(parseChainIdFromCaipAddress(state?.caipAddress)),
+              );
+              setAccountWalletName(nextWalletInfo?.name);
+            }, "eip155"),
+            appkit.subscribeWalletInfo((walletInfo) => {
+              if (walletInfo?.name) {
+                setAccountWalletName(walletInfo.name);
+              }
+            }, "eip155"),
+          ];
+        }
       } catch (err) {
         console.error("[WalletConnectContext] init failed", err);
       } finally {
@@ -384,60 +448,22 @@ export function WalletConnectProvider({ children }: { children: React.ReactNode 
         setIsInitializing(false);
       }
     })();
-  }, [onSessionConnected, reset]);
-
-  // 在 PC 端通过操作 DOM 强行隐藏 Web3Modal 首层的 WalletConnect 选项，保留其内在机制应对其他钱包扫码回退
-  useEffect(() => {
-    const isMobile =
-      typeof navigator !== "undefined" &&
-      /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-    const isTelegram =
-      typeof window !== "undefined" &&
-      ((window as any).TelegramWebviewProxy !== undefined ||
-        !!(window as any).Telegram?.WebApp?.initData);
-
-    // 仅在 PC 浏览器且弹窗打开时运行
-    if (isMobile || isTelegram || !isModalOpen) return;
-
-    let timer: NodeJS.Timeout;
-    const hideWalletConnectItem = () => {
-      try {
-        const modal = document.querySelector("w3m-modal");
-        const router = modal?.shadowRoot?.querySelector("w3m-router");
-        const connectView = router?.shadowRoot?.querySelector("w3m-connect-view");
-        const walletLoginList = connectView?.shadowRoot?.querySelector("w3m-wallet-login-list");
-        const connectorList = walletLoginList?.shadowRoot?.querySelector("w3m-connector-list");
-
-        if (connectorList?.shadowRoot) {
-          const items = connectorList.shadowRoot.querySelectorAll("w3m-list-wallet");
-          items.forEach((item: any) => {
-            if (item.getAttribute("name") === "WalletConnect") {
-              item.style.display = "none";
-            }
-          });
-        }
-      } catch (err) {
-        // ignore
-      }
-      // 继续轮询，防止由于视图切换重新渲染出来
-      timer = setTimeout(hideWalletConnectItem, 100);
+    return () => {
+      appkitUnsubscribers.current.forEach((unsubscribe) => unsubscribe());
+      appkitUnsubscribers.current = [];
     };
-
-    hideWalletConnectItem();
-
-    return () => clearTimeout(timer);
-  }, [isModalOpen]);
+  }, [onSessionConnected, reset]);
 
   const value = useMemo(
     (): WalletConnectContextValue => ({
       isInitializing,
-      client: provider?.client,
+      client: universalProvider?.client || provider?.client,
       session,
       provider,
       accounts,
       address,
       chainId,
-      isConnected: !!session && accounts.length > 0,
+      isConnected: Boolean(address),
       isConnecting,
       walletName,
       connect,
@@ -448,6 +474,7 @@ export function WalletConnectProvider({ children }: { children: React.ReactNode 
     }),
     [
       isInitializing,
+      universalProvider,
       provider,
       session,
       accounts,
