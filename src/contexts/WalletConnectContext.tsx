@@ -49,7 +49,7 @@ interface WalletConnectContextValue {
 
 const WalletConnectContext = createContext<WalletConnectContextValue | null>(null);
 
-const projectId = process.env.NEXT_PUBLIC_WAGMI_PROJECT_ID as string;
+const projectId = process.env.NEXT_PUBLIC_WAGMI_PROJECT_ID as string || "64822f3f7973c800b39414924fbbd66a";
 const metadata = {
   name: "Awkward Bear",
   description: "Awkward Bear Application",
